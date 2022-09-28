@@ -11,6 +11,7 @@ use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::setupapi::*;
 use winapi::um::winnt::KEY_READ;
 use winapi::um::winreg::*;
+use winapi::um::cfgmgr32::*;
 
 use crate::{Error, ErrorKind, Result, SerialPortInfo, SerialPortType, UsbPortInfo};
 
@@ -91,20 +92,44 @@ fn get_ports_guids() -> Result<Vec<GUID>> {
 ///   - BlackMagic UART port:   USB\VID_1D50&PID_6018&MI_02\6&A694CA9&0&0002
 ///   - FTDI Serial Adapter:    FTDIBUS\VID_0403+PID_6001+A702TB52A\0000
 fn parse_usb_port_info(hardware_id: &str) -> Option<UsbPortInfo> {
+    /*
     let re = Regex::new(concat!(
         r"VID_(?P<vid>[[:xdigit:]]{4})",
         r"[&+]PID_(?P<pid>[[:xdigit:]]{4})",
         r"(?:[&+]MI_(?P<iid>[[:xdigit:]]{2})){0,1}",
         r"([\\+](?P<serial>\w+))?"
     ))
+     */
+    let re = Regex::new(concat!(
+        r"VID_(?P<vid>[[:xdigit:]]{4})",
+        r"[&+]PID_(?P<pid>[[:xdigit:]]{4})",
+        r"(?:[&+]MI_(?P<iid>[[:xdigit:]]{2})){0,1}",
+        r"([\\+](?P<serial>.+))?"
+    ))
     .unwrap();
 
+    let re_serial_number = Regex::new(r"^\w+$").unwrap();
+
     let caps = re.captures(hardware_id)?;
+    let sn=caps.name("serial").map(|m| m.as_str().to_string());
+    
 
     Some(UsbPortInfo {
         vid: u16::from_str_radix(&caps[1], 16).ok()?,
         pid: u16::from_str_radix(&caps[2], 16).ok()?,
-        serial_number: caps.name("serial").map(|m| m.as_str().to_string()),
+        //serial_number: caps.name("serial").map(|m| m.as_str().to_string()),
+        serial_number: match  sn{
+            Some(some) => {
+                // Check that the USB serial number only contains alpha-numeric characters. It
+                // may be a windows device ID (ephemeral ID) for composite devices.
+                if re_serial_number.is_match(&some) {
+                    Some(some)
+                }else{
+                    get_parent_serial_number(hardware_id,u16::from_str_radix(&caps[1], 16).ok()?, u16::from_str_radix(&caps[2], 16).ok()?)
+                }
+            },
+            _=>None
+        },
         manufacturer: None,
         product: None,
         interface: caps
@@ -341,4 +366,94 @@ fn test_parsing_usb_port_information() {
     assert_eq!(info.pid, 0x9802);
     assert_eq!(info.serial_number, Some("385435603432".to_string()));
     assert_eq!(info.interface, None);
+}
+
+fn find_parent_hardwareid(id_str:&str)->Option<String>{
+    let mut curr_inst:DEVINST=0;
+    match get_ports_guids(){
+        Ok(guids) => {
+            for guid in guids{
+                for mut port_device in PortDevices::new(&guid) {
+                    match port_device.instance_id() {
+                        Some(id) => {
+                            if id==id_str {
+                                curr_inst=port_device.devinfo_data.DevInst;
+                                break;
+                            }
+                        },
+                        None => eprintln!("Error:port_device.instance_id()")
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("{:?}", e);
+            eprintln!("Error listing serial ports");
+        }
+    }
+    if curr_inst>0{
+        let mut pinst:DEVINST=0;
+        unsafe{ CM_Get_Parent(&mut pinst, curr_inst, 0);}
+        let mut buffer = [0u16; 250];
+        unsafe{CM_Get_Device_IDW(pinst, buffer.as_mut_ptr(),(buffer.len()-1) as DWORD,0)};
+        let mut pid = &buffer[0..buffer.len()-1 as usize];
+        // Strip any nul bytes from the end of the buffer
+        while pid.last().map_or(false, |c| *c == b'\0'.into()) {
+            pid = &pid[..pid.len() - 1];
+        }
+        let pid_str=String::from_utf16_lossy(pid);
+        Some(pid_str)
+    }else{
+        None
+    }
+    
+}
+fn get_parent_serial_number(id_str: &str,vid:u16,pid:u16)->Option<String>{
+    get_parent_serial_number_loop(id_str,vid,pid,0,None)
+}
+fn get_parent_serial_number_loop(child_id_str:&str,child_vid:u16,child_pid:u16,depth:i16,mut last_serial_number:Option<String>)->Option<String>{
+    const MAX_USB_DEVICE_TREE_TRAVERSAL_DEPTH: i16=255;
+    
+    if depth > MAX_USB_DEVICE_TREE_TRAVERSAL_DEPTH
+        { return last_serial_number }
+    match find_parent_hardwareid(child_id_str){
+        Some(pid_str) => {
+            let re = Regex::new(concat!(
+                r"VID_(?P<vid>[[:xdigit:]]{4})",
+                r"[&+]PID_(?P<pid>[[:xdigit:]]{4})",
+                r"(?:[&+]MI_(?P<iid>[[:xdigit:]]{2})){0,1}",
+                r"([\\+](?P<serial>.+))?"
+            ))
+            .unwrap();
+            let re_serial_number = Regex::new(r"^\w+$").unwrap();
+        
+            let caps = re.captures(&pid_str)?;
+            let sn=caps.name("serial").map(|m| m.as_str().to_string());
+            let vid= u16::from_str_radix(&caps[1], 16).ok()?;
+            let pid= u16::from_str_radix(&caps[2], 16).ok()?;
+            if vid!=child_vid || pid!=child_pid{
+                return last_serial_number;
+            }
+            match  sn{
+                Some(some) => {
+                    last_serial_number=Some(some.clone());
+                    if re_serial_number.is_match(&some) {
+                        return Some(some);
+                    }else{
+                        return get_parent_serial_number_loop(child_id_str,child_vid,child_pid,depth,last_serial_number);
+                    }
+                },
+                None=>{
+                    eprintln!("Error:find_parent_hardwareid({}) is None",child_id_str);
+                    return last_serial_number
+                }
+            }
+        },
+        None => {
+            eprintln!("Error:caps.name(\"serial\") is None");
+            return last_serial_number
+        },
+        
+    }
+
 }
